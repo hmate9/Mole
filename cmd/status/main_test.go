@@ -1,11 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
 func TestShouldUseJSONOutput_ForceFlag(t *testing.T) {
@@ -497,5 +504,70 @@ func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 	}
 	if len(classified) != typ.NumField() {
 		t.Fatalf("field classification count = %d, want %d", len(classified), typ.NumField())
+	}
+}
+
+// Run the real one-shot JSON path in a child so os.Exit and stdout stay
+// isolated. External commands are disabled and the process probe fails.
+func TestStatusJSONProcess(t *testing.T) {
+	if os.Getenv("MOLE_STATUS_JSON_TEST") == "" {
+		t.Skip("json subprocess helper")
+	}
+	runCmd = func(context.Context, string, ...string) (string, error) {
+		return "", errors.New("optional metric unavailable")
+	}
+	commandExists = func(string) bool { return false }
+	diskPartitionsFunc = func(bool) ([]disk.PartitionStat, error) {
+		return []disk.PartitionStat{{Device: "/dev/disk3s1", Mountpoint: "/", Fstype: "apfs"}}, nil
+	}
+	diskUsageFunc = func(string) (*disk.UsageStat, error) {
+		return &disk.UsageStat{Total: 2 << 30, Used: 1 << 30, Free: 1 << 30, UsedPercent: 50}, nil
+	}
+	collectProcessesFunc = func() (processSample, error) {
+		return processSample{}, errors.New("process probe failed")
+	}
+	runJSONMode()
+	os.Exit(0)
+}
+
+func TestJSONModePrintsPartialSnapshotWhenOneCollectorFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStatusJSONProcess$")
+	cmd.Env = append(os.Environ(), "MOLE_STATUS_JSON_TEST=1", "HOME="+t.TempDir(), "MOLE_TEST_NO_AUTH=1")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("json mode exited with %v; stderr: %s", err, &stderr)
+	}
+	if !strings.Contains(stderr.String(), "process probe failed") {
+		t.Fatalf("collector failure not reported on stderr: %q", &stderr)
+	}
+
+	var snapshot MetricsSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &snapshot); err != nil {
+		t.Fatalf("stdout is not one JSON snapshot: %v\n%s", err, &stdout)
+	}
+	if snapshot.CollectedAt.IsZero() || len(snapshot.Disks) != 1 || snapshot.Disks[0].Total != 2<<30 {
+		t.Fatalf("successful metrics missing: collected_at=%v disks=%+v", snapshot.CollectedAt, snapshot.Disks)
+	}
+	// The failed group stays marked the way README documents it: no sample time.
+	if snapshot.ProcessCollectedAt != nil || snapshot.ZombieCount != nil {
+		t.Fatalf("failed process probe reported a sample: %+v", snapshot)
+	}
+}
+
+func TestWriteJSONSnapshotFailsWhenNothingWasCollected(t *testing.T) {
+	for _, collectErr := range []error{errors.New("cpu probe failed"), nil} {
+		var stdout, stderr bytes.Buffer
+		if code := writeJSONSnapshot(&stdout, &stderr, MetricsSnapshot{}, collectErr); code != 1 {
+			t.Fatalf("empty snapshot exit = %d, want 1", code)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("empty snapshot printed JSON: %q", &stdout)
+		}
+		if !strings.Contains(stderr.String(), "status: collect failed:") {
+			t.Fatalf("empty snapshot gave no reason: %q", &stderr)
+		}
 	}
 }

@@ -251,17 +251,32 @@ func runJSONMode() {
 	collector := NewCollector(processWatchOptionsFromFlags())
 
 	data, err := collector.Collect()
+	if code := writeJSONSnapshot(os.Stdout, os.Stderr, data, err); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// writeJSONSnapshot follows the watch stream and the dashboard: one failed
+// collector is reported on stderr, and the metrics that did succeed are still
+// printed and exit 0. Only a snapshot with nothing collected fails the command.
+func writeJSONSnapshot(stdout, stderr io.Writer, data MetricsSnapshot, err error) int {
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error collecting metrics: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "status: collect failed: %v\n", err)
+	}
+	if data.CollectedAt.IsZero() {
+		if err == nil {
+			_, _ = fmt.Fprintln(stderr, "status: collect failed: no metrics collected")
+		}
+		return 1
 	}
 
-	encoder := json.NewEncoder(os.Stdout)
+	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(data); err != nil {
-		fmt.Fprintf(os.Stderr, "error encoding JSON: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "error encoding JSON: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
 // runTUIMode runs the interactive terminal UI.
