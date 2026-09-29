@@ -29,7 +29,8 @@ import (
 // v4: incomplete scans are no longer authoritative directory measurements.
 // v5: entries record their scan state, so a partial result lost only to
 // permission denials can be cached and still reads as partial.
-const cacheSchemaVersion = 5
+// v6: deletions invalidate ancestor totals and overview measurements.
+const cacheSchemaVersion = 6
 
 type overviewSizeSnapshot struct {
 	Size          int64     `json:"size"`
@@ -826,25 +827,23 @@ func removeOverviewSnapshots(paths ...string) {
 	}
 }
 
-// prefetchOverviewCache warms overview cache in background.
-func prefetchOverviewCache(ctx context.Context) {
-	entries := createOverviewEntries()
-
-	var needScan []string
-	for _, entry := range entries {
+// Register background writers before starting them. Workers receive a separate
+// immutable map, so only the model's event loop mutates its publication registry.
+func (m *model) startOverviewPrefetch(ctx context.Context) {
+	jobs := make(map[string]*scanPublication)
+	for _, entry := range createOverviewEntries() {
 		if size, err := loadStoredOverviewSize(entry.Path); err == nil && size > 0 {
 			continue
 		}
-		needScan = append(needScan, entry.Path)
+		jobs[entry.Path] = m.newBackgroundCacheWrite(ctx, entry.Path)
 	}
+	go prefetchOverviewCache(ctx, jobs)
+}
 
-	if len(needScan) == 0 {
-		return
-	}
-
+func prefetchOverviewCache(ctx context.Context, jobs map[string]*scanPublication) {
 	sem := make(chan struct{}, maxConcurrentOverview)
 	var wg sync.WaitGroup
-	for _, path := range needScan {
+	for path, publication := range jobs {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
@@ -860,11 +859,30 @@ func prefetchOverviewCache(ctx context.Context) {
 				return
 			}
 
-			size, err := measureOverviewSize(ctx, path)
-			if overviewMeasurementStorable(size, err) {
-				_ = storeOverviewMeasurement(path, size, err != nil)
-			}
+			_, _ = measureOverviewSizeWithPublication(publication.ctx, path, publication)
 		})
 	}
 	wg.Wait()
+}
+
+func (m *model) newBackgroundCacheWrite(ctx context.Context, path string) *scanPublication {
+	if m.cachePublications == nil {
+		m.cachePublications = make(map[string]*scanPublication)
+	}
+	if previous := m.cachePublications[path]; previous != nil {
+		previous.cancel()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	publication := newScanPublication(ctx, cancel)
+	m.cachePublications[path] = publication
+	return publication
+}
+
+func (m *model) cancelBackgroundCacheWrites(removedPaths []string) {
+	for path, publication := range m.cachePublications {
+		if len(removedPaths) == 0 || pathTouchesRemoved(path, removedPaths) {
+			publication.cancel()
+			delete(m.cachePublications, path)
+		}
+	}
 }

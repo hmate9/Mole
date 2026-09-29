@@ -185,10 +185,11 @@ const (
 )
 
 type overviewSizeMsg struct {
-	Path  string
-	Index int
-	Size  int64
-	Err   error
+	publication *scanPublication
+	Path        string
+	Index       int
+	Size        int64
+	Err         error
 }
 
 type tickMsg time.Time
@@ -229,7 +230,8 @@ type model struct {
 	largeOffset         int
 	overviewSizeCache   map[string]int64
 	overviewScanning    bool
-	overviewScanningSet map[string]bool // Track which paths are currently being scanned
+	overviewScanningSet map[string]*scanPublication // Track active measurements by identity
+	cachePublications   map[string]*scanPublication
 	width               int             // Terminal width
 	height              int             // Terminal height
 	multiSelected       map[string]bool // Track multi-selected items by path (safer than index)

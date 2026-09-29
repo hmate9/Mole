@@ -3562,7 +3562,7 @@ func TestDeleteRefreshesOverviewRowsOnGoBack(t *testing.T) {
 	if overview.entries[1].Size != appsSize {
 		t.Fatalf("expected the Applications row to keep %d, got %d", appsSize, overview.entries[1].Size)
 	}
-	if cmd == nil || !overview.overviewScanningSet[home] {
+	if cmd == nil || overview.overviewScanningSet[home] == nil {
 		t.Fatalf("expected going back to schedule the Home row measurement")
 	}
 	if overview.scanning {
@@ -4054,5 +4054,374 @@ func TestUnavailableEntryCannotBeSelectedForDeletion(t *testing.T) {
 	m = updated.(model)
 	if !m.deleteConfirm || m.deleteTarget == nil || m.deleteTarget.Path != readable {
 		t.Fatalf("readable selection lost its confirmation: %+v", m.deleteTarget)
+	}
+}
+
+func TestSchemaFiveSizesAreRejectedByEveryLoader(t *testing.T) {
+	for _, loader := range []string{"fresh", "stale", "overview-gob", "overview-json"} {
+		for _, version := range []int{5, cacheSchemaVersion} {
+			t.Run(fmt.Sprintf("%s/schema%d", loader, version), func(t *testing.T) {
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				resetOverviewSnapshotForTest()
+				t.Cleanup(resetOverviewSnapshotForTest)
+				target := filepath.Join(home, "target")
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if loader == "overview-json" {
+					path, err := getOverviewSizeStorePath()
+					if err != nil {
+						t.Fatal(err)
+					}
+					data, err := json.Marshal(map[string]overviewSizeSnapshot{target: {Size: 4096, Updated: time.Now(), SchemaVersion: version}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, data, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					path, err := getCachePath(target)
+					if err != nil {
+						t.Fatal(err)
+					}
+					file, err := os.Create(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					entry := cacheEntry{TotalSize: 4096, TotalFiles: 1, ModTime: time.Now(), ScanTime: time.Now(), SchemaVersion: version}
+					err = gob.NewEncoder(file).Encode(entry)
+					_ = file.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var err error
+				switch loader {
+				case "fresh":
+					_, err = loadCacheFromDisk(target)
+				case "stale":
+					_, err = loadStaleCacheFromDisk(target)
+				case "overview-gob":
+					_, _, err = loadOverviewCachedMeasurement(target)
+				case "overview-json":
+					_, _, err = loadStoredOverviewMeasurement(target)
+				}
+				if version == 5 && err == nil {
+					t.Fatal("schema 5 stale sizes were accepted")
+				}
+				if version != 5 && err != nil {
+					t.Fatalf("current schema rejected: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestDeleteRejectsAlreadyMeasuredOverviewMessage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetOverviewSnapshotForTest()
+	t.Cleanup(resetOverviewSnapshotForTest)
+	root := filepath.Join(home, "project")
+	removed := filepath.Join(root, "large.bin")
+	writeFileWithSize(t, removed, 8192)
+	m := newModel("/", true)
+	m.entries = []dirEntry{{Name: "Project", Path: root, IsDir: true, Size: -1}}
+	batch := m.scheduleOverviewScans()().(tea.BatchMsg)
+	old := batch[0]().(overviewSizeMsg)
+	if old.Err != nil || old.Size <= 0 {
+		t.Fatalf("old scan never completed: %+v", old)
+	}
+	// The scan finished, but its message waits behind a delete in the event loop.
+	m.path, m.isOverview = root, false
+	m.entries = []dirEntry{{Name: "large.bin", Path: removed, Size: 8192}}
+	m.entriesAll = slices.Clone(m.entries)
+	updated, _ := m.Update(deleteProgressMsg{done: true, count: 1, path: removed})
+	m = updated.(model)
+	updated, _ = m.Update(old)
+	m = updated.(model)
+	if _, ok := m.overviewSizeCache[root]; ok {
+		t.Fatal("late overview message restored deleted bytes")
+	}
+	if _, err := loadStoredOverviewSize(root); err == nil {
+		t.Fatal("deleted overview snapshot survived")
+	}
+}
+
+func TestDeleteCancelsOverviewPublicationBeforeInvalidation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetOverviewSnapshotForTest()
+	t.Cleanup(resetOverviewSnapshotForTest)
+	root, sibling := filepath.Join(home, "project"), filepath.Join(home, "applications")
+	writeFileWithSize(t, filepath.Join(root, "nested", "file"), 8192)
+	writeFileWithSize(t, filepath.Join(sibling, "file"), 4096)
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "du-started")
+	t.Setenv("OVERVIEW_TEST_MARKER", marker)
+	if err := os.WriteFile(filepath.Join(bin, "du"), []byte("#!/bin/sh\nprintf started > \"$OVERVIEW_TEST_MARKER\"\nprintf '4 total\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m := newModel("/", true)
+	m.entries = []dirEntry{{Name: "Project", Path: root, IsDir: true, Size: -1}, {Name: "Applications", Path: sibling, IsDir: true, Size: -1}}
+	batch := m.scheduleOverviewScans()().(tea.BatchMsg)
+	oldPublication, siblingPublication := m.overviewScanningSet[root], m.overviewScanningSet[sibling]
+	// Block publication after measurement, without adding a timing hook to production.
+	oldPublication.mu.Lock()
+	oldResults := make(chan overviewSizeMsg, 1)
+	go func() { oldResults <- batch[0]().(overviewSizeMsg) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			oldPublication.mu.Unlock()
+			t.Fatal("measurement never reached du")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.path, m.isOverview = root, false
+	deleted := make(chan model, 1)
+	go func() {
+		updated, _ := m.Update(deleteProgressMsg{done: true, count: 1, path: filepath.Join(root, "nested", "file")})
+		deleted <- updated.(model)
+	}()
+	for !oldPublication.canceling.Load() {
+		if time.Now().After(deadline) {
+			oldPublication.mu.Unlock()
+			t.Fatal("delete did not cancel the affected scan")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	oldPublication.mu.Unlock()
+	select {
+	case m = <-deleted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delete blocked")
+	}
+	old := <-oldResults
+	if !errors.Is(old.Err, context.Canceled) {
+		t.Fatalf("old measurement was not canceled: %+v", old)
+	}
+	if _, err := loadStoredOverviewSize(root); err == nil {
+		t.Fatal("old measurement republished after invalidation")
+	}
+	if m.overviewScanningSet[sibling] != siblingPublication || siblingPublication.ctx.Err() != nil {
+		t.Fatal("unrelated scan was canceled")
+	}
+	m.path, m.isOverview = "/", true
+	m.entries = []dirEntry{{Name: "Project", Path: root, IsDir: true, Size: -1}, {Name: "Applications", Path: sibling, IsDir: true, Size: -1}}
+	newBatch := m.scheduleOverviewScans()().(tea.BatchMsg)
+	newPublication := m.overviewScanningSet[root]
+	if newPublication == nil || newPublication == oldPublication {
+		t.Fatal("replacement scan missing")
+	}
+	updated, _ := m.Update(old)
+	m = updated.(model)
+	if m.overviewScanningSet[root] != newPublication {
+		t.Fatal("old message cleared the replacement scan")
+	}
+	if _, ok := m.overviewSizeCache[root]; ok {
+		t.Fatal("old message restored an in-memory size")
+	}
+	fresh := newBatch[0]().(overviewSizeMsg)
+	updated, _ = m.Update(fresh)
+	m = updated.(model)
+	if fresh.Err != nil || m.overviewSizeCache[root] != 4096 {
+		t.Fatalf("fresh scan was not published: %+v", fresh)
+	}
+	if size, err := loadStoredOverviewSize(root); err != nil || size != 4096 {
+		t.Fatalf("fresh disk snapshot: %d, %v", size, err)
+	}
+	other := batch[1]().(overviewSizeMsg)
+	updated, _ = m.Update(other)
+	m = updated.(model)
+	if other.Err != nil || m.overviewSizeCache[sibling] != 4096 {
+		t.Fatalf("unrelated scan could not complete: %+v", other)
+	}
+}
+
+func TestPrefetchHonorsSelectiveCacheWriteCancellation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetOverviewSnapshotForTest()
+	t.Cleanup(resetOverviewSnapshotForTest)
+	root, sibling := filepath.Join(home, "project"), filepath.Join(home, "applications")
+	writeFileWithSize(t, filepath.Join(root, "file"), 8192)
+	writeFileWithSize(t, filepath.Join(sibling, "file"), 4096)
+	m := newModel(root, false)
+	old := m.newBackgroundCacheWrite(context.Background(), root)
+	other := m.newBackgroundCacheWrite(context.Background(), sibling)
+	jobs := map[string]*scanPublication{root: old, sibling: other}
+	m.cancelBackgroundCacheWrites([]string{filepath.Join(root, "file")})
+	invalidateCacheAncestry([]string{filepath.Join(root, "file")})
+	prefetchOverviewCache(context.Background(), jobs)
+	if _, err := loadStoredOverviewSize(root); err == nil {
+		t.Fatal("canceled prefetch restored a snapshot")
+	}
+	if size, err := loadStoredOverviewSize(sibling); err != nil || size <= 0 {
+		t.Fatalf("unrelated prefetch lost: %d, %v", size, err)
+	}
+	if old.ctx.Err() == nil || other.ctx.Err() != nil || m.cachePublications[sibling] != other {
+		t.Fatal("wrong prefetch cancellation boundary")
+	}
+	m.cancelBackgroundCacheWrites(nil)
+}
+
+func TestCompletedScanCacheWritesRemainCancelable(t *testing.T) {
+	for _, live := range []bool{true, false} {
+		t.Run(fmt.Sprintf("live=%t", live), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			resetOverviewSnapshotForTest()
+			t.Cleanup(resetOverviewSnapshotForTest)
+			root := filepath.Join(home, "project")
+			writeFileWithSize(t, filepath.Join(root, "file"), 4096)
+			m := newModel(root, false)
+			result := scanResult{TotalSize: 4096, TotalFiles: 1, Entries: []dirEntry{{Name: "file", Path: filepath.Join(root, "file"), Size: 4096}}}
+			if live {
+				m.finishLiveScan(result)
+			} else {
+				updated, _ := m.Update(scanResultMsg{path: root, result: result})
+				m = updated.(model)
+			}
+			publication := m.cachePublications[root]
+			if publication == nil {
+				t.Fatal("completed scan wrote without a cancelable publication")
+			}
+			m.cancelBackgroundCacheWrites([]string{filepath.Join(root, "file")})
+			invalidateCacheAncestry([]string{filepath.Join(root, "file")})
+			if err := publication.commit(func() error { return storeOverviewSize(root, 8192) }); !errors.Is(err, context.Canceled) {
+				t.Fatalf("late write accepted: %v", err)
+			}
+			if err := saveCacheToDiskWithOptions(publication, root, result, false); !errors.Is(err, context.Canceled) {
+				t.Fatalf("late gob write accepted: %v", err)
+			}
+			if _, err := loadStoredOverviewSize(root); err == nil {
+				t.Fatal("snapshot survived cancellation")
+			}
+			if _, err := loadCacheFromDisk(root); err == nil {
+				t.Fatal("directory cache survived cancellation")
+			}
+		})
+	}
+}
+
+func TestDirectoryRefreshCancelsEarlierOverviewRequest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetOverviewSnapshotForTest()
+	t.Cleanup(resetOverviewSnapshotForTest)
+	root, sibling := filepath.Join(home, "project"), filepath.Join(home, "applications")
+	writeFileWithSize(t, filepath.Join(root, "file"), 8192)
+	writeFileWithSize(t, filepath.Join(sibling, "file"), 4096)
+	m := newModel("/", true)
+	m.entries = []dirEntry{{Name: "Project", Path: root, IsDir: true, Size: -1}, {Name: "Applications", Path: sibling, IsDir: true, Size: -1}}
+	batch := m.scheduleOverviewScans()().(tea.BatchMsg)
+	oldPublication, otherPublication := m.overviewScanningSet[root], m.overviewScanningSet[sibling]
+	old := batch[0]().(overviewSizeMsg)
+	if old.Err != nil || old.Size <= 0 {
+		t.Fatalf("old request did not measure: %+v", old)
+	}
+	// Enter the directory while overview messages are still pending, then refresh it.
+	m.path, m.isOverview = root, false
+	updated, _ := m.updateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(model)
+	if oldPublication.ctx.Err() == nil {
+		t.Fatal("directory refresh left its overview request active")
+	}
+	updated, _ = m.Update(old)
+	m = updated.(model)
+	if _, ok := m.overviewSizeCache[root]; ok {
+		t.Fatal("old message restored the refreshed size")
+	}
+	if _, err := loadStoredOverviewSize(root); err == nil {
+		t.Fatal("old snapshot survived refresh")
+	}
+	if m.overviewScanningSet[sibling] != otherPublication || otherPublication.ctx.Err() != nil {
+		t.Fatal("refresh canceled an unrelated request")
+	}
+	other := batch[1]().(overviewSizeMsg)
+	updated, _ = m.Update(other)
+	m = updated.(model)
+	if other.Err != nil || m.overviewSizeCache[sibling] <= 0 {
+		t.Fatalf("unrelated request did not finish: %+v", other)
+	}
+}
+
+func TestDeleteAfterRefreshCancelsLiveScanBeforeCacheInvalidation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetOverviewSnapshotForTest()
+	t.Cleanup(resetOverviewSnapshotForTest)
+	root := filepath.Join(home, "project")
+	removed := filepath.Join(root, "file")
+	writeFileWithSize(t, removed, 4096)
+	entry := dirEntry{Name: "file", Path: removed, Size: 4096}
+	result := scanResult{TotalSize: 4096, TotalFiles: 1, Entries: []dirEntry{entry}}
+	m := newModel(root, false)
+	m.scanning = false
+	m.entries, m.entriesAll = []dirEntry{entry}, []dirEntry{entry}
+
+	updated, _ := m.updateKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(model)
+	if !m.deleteConfirm {
+		t.Fatal("delete confirmation was not reached")
+	}
+	updated, deleteCmd := m.updateKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if !m.deleting || deleteCmd == nil {
+		t.Fatal("confirmed delete was not scheduled")
+	}
+	// Keep the deletion command pending. Refresh is accepted during deletion;
+	// deliver its scan-start message without running either external command.
+	updated, refreshCmd := m.updateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(model)
+	if !m.deleting || !m.scanning || refreshCmd == nil {
+		t.Fatal("refresh during deletion was not scheduled")
+	}
+	canceled := false
+	updated, _ = m.Update(liveScanStartMsg{
+		id: 1, path: root, entries: result.Entries, totalSize: result.TotalSize,
+		totalFiles: result.TotalFiles, events: make(chan liveScanEventMsg),
+		cancel: func() {
+			// Model a publication that won the lock just before cancellation.
+			// cancel must wait for it, then invalidation must remove its output.
+			canceled = true
+			if err := storeOverviewSize(root, result.TotalSize); err != nil {
+				t.Fatal(err)
+			}
+			if err := saveCacheToDisk(root, result); err != nil {
+				t.Fatal(err)
+			}
+			if size, err := loadStoredOverviewSize(root); err != nil || size != result.TotalSize {
+				t.Fatalf("snapshot publication did not run: %d, %v", size, err)
+			}
+			if cached, err := loadCacheFromDisk(root); err != nil || cached.TotalSize != result.TotalSize {
+				t.Fatalf("directory publication did not run: %+v, %v", cached, err)
+			}
+		},
+	})
+	m = updated.(model)
+	if m.liveScanCancel == nil || !m.deleting || !m.scanning {
+		t.Fatal("live scan did not start while deletion was pending")
+	}
+	updated, _ = m.Update(deleteProgressMsg{done: true, count: 1, path: removed})
+	m = updated.(model)
+	if !canceled || m.liveScanCancel != nil {
+		t.Fatal("delete completion did not cancel the refreshed live scan")
+	}
+	if _, err := loadStoredOverviewSize(root); err == nil {
+		t.Error("live scan restored an overview snapshot after delete invalidation")
+	}
+	if _, err := loadCacheFromDisk(root); err == nil {
+		t.Error("live scan restored a directory cache after delete invalidation")
 	}
 }

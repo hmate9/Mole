@@ -20,7 +20,7 @@ func (m *model) scheduleOverviewScans() tea.Cmd {
 
 	var pendingIndices []int
 	for i, entry := range m.entries {
-		if entry.Size < 0 && !m.overviewScanningSet[entry.Path] {
+		if entry.Size < 0 && m.overviewScanningSet[entry.Path] == nil {
 			pendingIndices = append(pendingIndices, i)
 			if len(pendingIndices) >= maxConcurrentOverview {
 				break
@@ -40,8 +40,13 @@ func (m *model) scheduleOverviewScans() tea.Cmd {
 	var cmds []tea.Cmd
 	for _, idx := range pendingIndices {
 		entry := m.entries[idx]
-		m.overviewScanningSet[entry.Path] = true
-		cmd := scanOverviewPathCmd(entry.Path, idx)
+		ctx, cancel := context.WithCancel(context.Background())
+		publication := newScanPublication(ctx, cancel)
+		if m.overviewScanningSet == nil {
+			m.overviewScanningSet = make(map[string]*scanPublication)
+		}
+		m.overviewScanningSet[entry.Path] = publication
+		cmd := scanOverviewPathCmd(entry.Path, idx, publication)
 		cmds = append(cmds, cmd)
 	}
 
@@ -226,17 +231,18 @@ func (m *model) finishLiveScan(result scanResult) {
 		m.selectEntryPath(selectedPath)
 	}
 	m.cache[m.path] = historyEntryFromScanResult(m.path, result, m.cache[m.path], false)
+	publication := m.newBackgroundCacheWrite(context.Background(), m.path)
 	if m.scanState == scanComplete && m.totalSize > 0 {
 		if m.overviewSizeCache == nil {
 			m.overviewSizeCache = make(map[string]int64)
 		}
 		m.overviewSizeCache[m.path] = m.totalSize
 		go func(path string, size int64) {
-			_ = storeOverviewSize(path, size)
+			_ = publication.commit(func() error { return storeOverviewSize(path, size) })
 		}(m.path, m.totalSize)
 	}
 	go func(path string, scan scanResult) {
-		_ = saveCacheToDisk(path, scan)
+		_ = saveCacheToDiskWithOptions(publication, path, scan, false)
 	}(m.path, result)
 	m.status = scanSummary(m.totalSize, m.scanState)
 }
@@ -301,6 +307,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(removedPaths) > 0 {
 				// m.path is an ancestor of every removed path, so this also
 				// covers the current view.
+				m.cancelLiveScan()
+				m.cancelOverviewScans(removedPaths)
+				m.cancelBackgroundCacheWrites(removedPaths)
 				invalidateCacheAncestry(removedPaths)
 				if msg.err != nil {
 					m.status = fmt.Sprintf("Deleted %d items; some failed: %v", msg.count, msg.err)
@@ -331,7 +340,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				m.cancelLiveScan()
 				m.scanning = true
 				atomic.StoreInt64(m.filesScanned, 0)
 				atomic.StoreInt64(m.dirsScanned, 0)
@@ -386,8 +394,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.overviewSizeCache = make(map[string]int64)
 			}
 			m.overviewSizeCache[m.path] = m.totalSize
+			publication := m.newBackgroundCacheWrite(context.Background(), m.path)
 			go func(path string, size int64) {
-				_ = storeOverviewSize(path, size)
+				_ = publication.commit(func() error { return storeOverviewSize(path, size) })
 			}(m.path, m.totalSize)
 		}
 
@@ -470,6 +479,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, waitLiveScanEventCmd(m.liveScanEvents)
 		}
 	case overviewSizeMsg:
+		if m.overviewScanningSet[msg.Path] != msg.publication {
+			return m, nil
+		}
 		delete(m.overviewScanningSet, msg.Path)
 
 		if msg.Err == nil {
@@ -678,13 +690,15 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.largeMultiSelected = make(map[string]bool)
 
 		if m.inOverviewMode() {
+			m.cancelOverviewScans(nil)
+			m.cancelBackgroundCacheWrites(nil)
 			// Explicitly invalidate cache for all overview entries to force re-scan
 			for _, entry := range m.entries {
 				invalidateCache(entry.Path)
 			}
 
 			m.overviewSizeCache = make(map[string]int64)
-			m.overviewScanningSet = make(map[string]bool)
+			m.overviewScanningSet = make(map[string]*scanPublication)
 			m.hydrateOverviewEntries() // Reset sizes to pending
 			m.selected = 0
 			m.offset = 0
@@ -700,6 +714,8 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.scheduleOverviewScans(), m.detectLocalSnapshotsCmd(), tickCmd())
 		}
 
+		m.cancelOverviewScans([]string{m.path})
+		m.cancelBackgroundCacheWrites([]string{m.path})
 		invalidateCacheTree(m.path)
 		m.status = "Refreshing..."
 		m.scanning = true
@@ -1246,14 +1262,26 @@ func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func scanOverviewPathCmd(path string, index int) tea.Cmd {
+func scanOverviewPathCmd(path string, index int, publication *scanPublication) tea.Cmd {
 	return func() tea.Msg {
-		size, err := measureInsightSize(context.Background(), path)
+		size, err := measureInsightSizeWithPublication(publication.ctx, path, publication)
 		return overviewSizeMsg{
-			Path:  path,
-			Index: index,
-			Size:  size,
-			Err:   err,
+			publication: publication,
+			Path:        path,
+			Index:       index,
+			Size:        size,
+			Err:         err,
+		}
+	}
+}
+
+// Cancel before invalidating stored measurements, so an in-flight scan cannot
+// publish pre-delete bytes after the invalidation has finished.
+func (m *model) cancelOverviewScans(removedPaths []string) {
+	for path, publication := range m.overviewScanningSet {
+		if len(removedPaths) == 0 || pathTouchesRemoved(path, removedPaths) {
+			publication.cancel()
+			delete(m.overviewScanningSet, path)
 		}
 	}
 }
