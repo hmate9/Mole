@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -417,6 +418,39 @@ func (m *model) removePathFromView(path string) {
 
 	m.applyEntryFilter()
 	m.applyLargeFilter()
+}
+
+// pathIsWithin reports whether path is root or lies below it. A bare
+// root+"/" prefix never matches for the overview, whose path is "/": the
+// prefix becomes "//".
+func pathIsWithin(path, root string) bool {
+	if path == root {
+		return true
+	}
+	prefix := root
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return strings.HasPrefix(path, prefix)
+}
+
+// pathTouchesRemoved reports whether a delete changed what path measures: it
+// contains a removed path, or was itself inside one.
+func pathTouchesRemoved(path string, removedPaths []string) bool {
+	return slices.ContainsFunc(removedPaths, func(removed string) bool {
+		return pathIsWithin(removed, path) || pathIsWithin(path, removed)
+	})
+}
+
+// markRemovedOverviewRowsPending resets the overview rows a delete changed to
+// pending so they are measured again instead of restored.
+func markRemovedOverviewRowsPending(entries []dirEntry, removedPaths []string) {
+	for i := range entries {
+		if pathTouchesRemoved(entries[i].Path, removedPaths) {
+			entries[i].Size = -1
+			entries[i].State = scanComplete
+		}
+	}
 }
 
 func fileEntryName(f fileEntry) string { return f.Name }

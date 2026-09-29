@@ -626,14 +626,16 @@ func loadCacheFromDisk(path string) (*cacheEntry, error) {
 		return nil, fmt.Errorf("cache expired: too old")
 	}
 
+	// Entries were added, removed, or renamed here since the scan, so the
+	// recorded listing and total no longer describe the directory. Every caller
+	// of this loader treats its result as current, including a parent scan that
+	// folds it into its own total, so a changed directory is refused however
+	// recent the scan. The TUI still paints it at once through
+	// loadStaleCacheFromDisk and refreshes behind it, and the rescan reuses the
+	// unchanged subtrees below, so refusing costs one level, not a full scan.
 	if info.ModTime().After(entry.ModTime) {
-		// Allow grace window.
 		if cacheModTimeGrace <= 0 || info.ModTime().Sub(entry.ModTime) > cacheModTimeGrace {
-			// Directory mod time is noisy on macOS; reuse recent cache to avoid
-			// frequent full rescans while still forcing refresh for older entries.
-			if cacheReuseWindow <= 0 || scanAge > cacheReuseWindow {
-				return nil, fmt.Errorf("cache expired: directory modified")
-			}
+			return nil, fmt.Errorf("cache expired: directory modified")
 		}
 	}
 
@@ -752,6 +754,29 @@ func peekCacheTotalFiles(path string) (int64, error) {
 func invalidateCache(path string) {
 	removeCacheEntry(path)
 	removeOverviewSnapshots(path)
+}
+
+// invalidateCacheAncestry drops the cache entry and overview snapshot of each
+// removed path and of every directory above it. Deleting deep in a tree leaves
+// the ancestors' mtimes untouched, so their recorded totals, which still count
+// the removed bytes, would otherwise pass every freshness check until the TTL.
+func invalidateCacheAncestry(paths []string) {
+	seen := make(map[string]bool)
+	var targets []string
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		for dir := filepath.Clean(path); !seen[dir]; dir = filepath.Dir(dir) {
+			seen[dir] = true
+			targets = append(targets, dir)
+		}
+	}
+	for _, target := range targets {
+		removeCacheEntry(target)
+	}
+	// One snapshot save for all of them, as in invalidateCacheTree.
+	removeOverviewSnapshots(targets...)
 }
 
 // invalidateCacheTree invalidates the cache for path and all its direct

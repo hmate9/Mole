@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -297,32 +296,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			for _, removedPath := range removedPaths {
 				m.removePathFromView(removedPath)
-				invalidateCache(removedPath)
 			}
 
 			if len(removedPaths) > 0 {
-				invalidateCache(m.path)
+				// m.path is an ancestor of every removed path, so this also
+				// covers the current view.
+				invalidateCacheAncestry(removedPaths)
 				if msg.err != nil {
 					m.status = fmt.Sprintf("Deleted %d items; some failed: %v", msg.count, msg.err)
 				} else {
 					m.status = fmt.Sprintf("Deleted %d items", msg.count)
 				}
 
-				// Selective invalidation: only mark current path and ancestors as needing refresh
-				currentPath := m.path
-				for currentPath != "/" && currentPath != "" {
-					if entry, exists := m.cache[currentPath]; exists {
+				// Selective invalidation: only views whose size the delete
+				// changed need a refresh.
+				for path, entry := range m.cache {
+					if pathTouchesRemoved(path, removedPaths) {
 						entry.NeedsRefresh = true
-						m.cache[currentPath] = entry
+						m.cache[path] = entry
 					}
-					currentPath = filepath.Dir(currentPath)
 				}
-
-				// Mark history entries for current path and ancestors as needing refresh
+				for path := range m.overviewSizeCache {
+					if pathTouchesRemoved(path, removedPaths) {
+						delete(m.overviewSizeCache, path)
+					}
+				}
 				for i := range m.history {
-					histPath := m.history[i].Path
-					if histPath == m.path || strings.HasPrefix(m.path, histPath+"/") {
-						m.history[i].NeedsRefresh = true
+					if !pathIsWithin(m.path, m.history[i].Path) {
+						continue
+					}
+					m.history[i].NeedsRefresh = true
+					if m.history[i].IsOverview {
+						markRemovedOverviewRowsPending(m.history[i].Entries, removedPaths)
 					}
 				}
 
@@ -1100,6 +1105,20 @@ func (m model) goBack() (tea.Model, tea.Cmd) {
 	}
 	if m.selected < 0 {
 		m.selected = 0
+	}
+	if m.inOverviewMode() {
+		// The overview is measured row by row, never as one scan of "/". Rows
+		// a delete changed come back pending and are measured again here.
+		m.scanning = false
+		m.scanTransient = false
+		m.viewNeedsRefresh = false
+		if hasPendingOverviewEntries(m.entries) {
+			m.totalSize = sumKnownEntrySizes(m.entries)
+			m.scanState = entryScanState(m.entries)
+			return m, m.scheduleOverviewScans()
+		}
+		m.status = scanSummary(m.totalSize, m.scanState)
+		return m, nil
 	}
 	if last.NeedsRefresh {
 		m.status = fmt.Sprintf("Loaded cached data for %s, refreshing...", displayPath(m.path))
