@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"reflect"
@@ -526,6 +527,20 @@ func TestStatusJSONProcess(t *testing.T) {
 	collectProcessesFunc = func() (processSample, error) {
 		return processSample{}, errors.New("process probe failed")
 	}
+	scenario := os.Getenv("MOLE_STATUS_JSON_TEST")
+	if scenario != "1" {
+		collectCPUFunc = func() (CPUStatus, error) { return CPUStatus{}, errors.New("cpu probe failed") }
+		collectMemoryFunc = func() (MemoryStatus, error) { return MemoryStatus{}, errors.New("memory probe failed") }
+		diskPartitionsFunc = func(bool) ([]disk.PartitionStat, error) { return nil, errors.New("disk probe failed") }
+		switch scenario {
+		case "cpu":
+			collectCPUFunc = func() (CPUStatus, error) { return CPUStatus{LogicalCPU: 2}, nil }
+		case "memory":
+			collectMemoryFunc = func() (MemoryStatus, error) { return MemoryStatus{Total: 8 << 30}, nil }
+		case "processes":
+			collectProcessesFunc = func() (processSample, error) { return processSample{}, nil }
+		}
+	}
 	runJSONMode()
 	os.Exit(0)
 }
@@ -569,5 +584,67 @@ func TestWriteJSONSnapshotFailsWhenNothingWasCollected(t *testing.T) {
 		if !strings.Contains(stderr.String(), "status: collect failed:") {
 			t.Fatalf("empty snapshot gave no reason: %q", &stderr)
 		}
+	}
+}
+
+func TestJSONModeCollectorAvailability(t *testing.T) {
+	for _, scenario := range []string{"none", "cpu", "memory", "processes"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStatusJSONProcess$")
+			cmd.Env = append(os.Environ(), "MOLE_STATUS_JSON_TEST="+scenario, "HOME="+t.TempDir(), "MOLE_TEST_NO_AUTH=1")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			if scenario == "none" {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 {
+					t.Fatalf("all failed: err=%v stdout=%q stderr=%q", err, &stdout, &stderr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("partial snapshot failed: %v, %s", err, &stderr)
+				}
+				var snapshot MetricsSnapshot
+				if err := json.Unmarshal(stdout.Bytes(), &snapshot); err != nil {
+					t.Fatal(err)
+				}
+				if snapshot.CollectedAt.IsZero() {
+					t.Fatal("missing collection time")
+				}
+				switch scenario {
+				case "cpu":
+					if snapshot.CPU.LogicalCPU != 2 || snapshot.CPU.Usage != 0 {
+						t.Fatalf("idle CPU sample lost: %+v", snapshot.CPU)
+					}
+				case "memory":
+					if snapshot.Memory.Total != 8<<30 {
+						t.Fatalf("memory sample lost: %+v", snapshot.Memory)
+					}
+				case "processes":
+					if snapshot.ProcessCollectedAt == nil || len(snapshot.TopProcesses) != 0 {
+						t.Fatalf("empty process sample lost: %+v", snapshot)
+					}
+				}
+			}
+			if !strings.Contains(stderr.String(), "probe failed") {
+				t.Fatalf("missing collector errors: %q", &stderr)
+			}
+		})
+	}
+}
+
+func TestWriteJSONSnapshotReportsOutputFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	_ = reader.Close()
+	defer writer.Close()
+	var stderr bytes.Buffer
+	data := MetricsSnapshot{Memory: MemoryStatus{Total: 8 << 30}}
+	if code := writeJSONSnapshot(writer, &stderr, data, nil); code != 1 {
+		t.Fatalf("output failure exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "error encoding JSON:") {
+		t.Fatalf("missing output error: %q", &stderr)
 	}
 }
